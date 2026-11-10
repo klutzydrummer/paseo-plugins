@@ -27,8 +27,10 @@ export const ContextCompactSettingsSchema = z.object({
     .string()
     .default(
       "[context-compact] Your context is at {pct}% of {window} tokens; auto-compaction runs at {compact}%. " +
-        "Before it does, bring your durable notes up to date (handoff, progress file or plan, whichever this " +
-        "project keeps). Then reply in one line and carry on with your current work.",
+        "Hand off now without asking the user: write your state file and a handoff file, call " +
+        "stow_handoff(<short pointer text>) saying the handoff file is the source of truth and wins on any " +
+        "conflict, then end your turn. If stow_handoff is unavailable, write the handoff file and report its path " +
+        "to your parent (the user, if you are top level).",
     ),
 });
 

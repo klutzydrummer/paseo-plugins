@@ -9,7 +9,7 @@ import {
   providerMatches,
   turnEligible,
 } from "../shared/decision.ts";
-import { ContextCompactSettingsSchema, compactEnv, type ContextCompactSettings } from "../shared/settings.ts";
+import { ContextCompactSettingsSchema, DEFAULT_SETTINGS, compactEnv, type ContextCompactSettings } from "../shared/settings.ts";
 
 // Settings built directly (bypassing the schema) so windows below the schema minimum can be exercised.
 const mk = (over: Partial<ContextCompactSettings> = {}): ContextCompactSettings => ({
@@ -97,4 +97,11 @@ test("handoffPct above compactPct never nudges (skip wins over candidate once pc
   const s = mk({ handoffPct: 99, compactPct: 95 });
   assert.equal(verdictFor(155_000, s), "rearm"); // 97% < 99
   assert.equal(verdictFor(159_000, s), "skip");
+});
+
+test("default nudge text tells the agent to self-initiate handoff via stow_handoff", () => {
+  const t = buildNudgeText(mk({ handoffPrompt: DEFAULT_SETTINGS.handoffPrompt }), 50);
+  assert.ok(t.startsWith("[context-compact] "));
+  for (const frag of ["without asking the user", "state file", "handoff file", "stow_handoff(", "source of truth", "wins on any conflict", "end your turn", "report its path"])
+    assert.ok(t.includes(frag), frag);
 });
