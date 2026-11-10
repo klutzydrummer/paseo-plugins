@@ -11,10 +11,11 @@
     "directory": "context-compact"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
   },
   "devDependencies": {
-    "@getpaseo/plugin": "0.13.0",
+    "@getpaseo/plugin": "0.15.4",
     "@types/node": "^22.10.2",
     "@types/react": "~19.2.0",
     "react": "19.1.0",

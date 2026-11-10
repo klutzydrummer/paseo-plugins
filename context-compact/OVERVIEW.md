@@ -22,10 +22,13 @@ With the defaults, Claude Code compacts at 60% of 1M tokens (about 600k; Claude 
 - Before a Claude session opens (new agent, resume, refresh or import), the plugin adds the two environment variables to it. Claude Code then compacts the chat in place when the threshold is reached and carries on; nothing is restarted.
 - At the end of each turn, it reads the size of the last request from the agent's transcript and sends the nudge once when the context passes the nudge percentage. The nudge re-arms after the context drops back below it, which happens after a compaction.
 
+- Agents also get a `stow_handoff(text)` tool. An agent calls it with a handoff note and ends its turn; the plugin then sends `/clear` to that agent, waits until it is idle, and sends the note as its next prompt. The note is used once, a second call replaces the first, and an empty note is rejected. This lets an agent restart from a clean context without you doing it by hand.
+
 ![An agent receives the nudge at 58%, saves its handoff and carries on (custom nudge text)](assets/nudge.png)
 
 ## Limits
 
+- `stow_handoff` needs Paseo 0.15.0 or newer. It is attached when a session opens, and sessions that are already running get it after `paseo plugin reload` (verified live). A pending note is saved to disk (`~/.local/state/paseo-plugins/context-compact/stow/`, one private file per agent) and reloaded at startup, so a daemon restart does not lose it; it is deleted before delivery, and notes older than 24 hours are dropped. If the agent no longer exists, the note is simply never delivered and expires. `/clear` is sent without agent-origin markup, but that depends on the daemon; check it on your setup.
 - A change applies to a chat the next time it opens. A running Claude process keeps the settings it started with.
 - Claude Code chats started outside Paseo are not affected.
 - An `env` entry for the same variables in `~/.claude/settings.json` is applied by Claude Code after launch and overrides this plugin.
@@ -33,4 +36,4 @@ With the defaults, Claude Code compacts at 60% of 1M tokens (about 600k; Claude 
 
 ## Data and permissions
 
-It reads Paseo's agent records and Claude Code transcripts on the daemon host, sets two environment variables on Claude sessions, and sends the nudge prompt to agents. It makes no network requests.
+It reads Paseo's agent records and Claude Code transcripts on the daemon host, sets two environment variables on Claude sessions, and sends the nudge prompt, `/clear` and stowed handoff notes to agents. It makes no network requests.

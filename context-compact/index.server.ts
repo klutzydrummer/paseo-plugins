@@ -1,8 +1,12 @@
-import type { PluginServerContext } from "@getpaseo/plugin/server";
+import { defineAgentTool, type PluginServerContext } from "@getpaseo/plugin/server";
+import { z } from "zod";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import fsNode from "node:fs";
+import { createStow, STOW_MAX_AGE_MS } from "./shared/stow";
 import { compactEnv, contextCompactSettings, type ContextCompactSettings } from "./shared/settings";
+import { buildNudgeText, classifyPct, contextPct, isNudgeEcho, providerMatches, turnEligible } from "./shared/decision";
 
 // context-compact — Claude Code auto-compaction threshold for every Claude session Paseo opens, plus an optional
 // "update your notes before compaction" nudge.
@@ -27,7 +31,7 @@ const AGENTS_DIR = path.join(process.env.PASEO_HOME || path.join(HOME, ".paseo")
 const CLAUDE_PROJECTS = path.join(HOME, ".claude", "projects");
 const TAIL_BYTES = 512 * 1024;
 const FLUSH_RETRY_MS = 1500;
-const PREFIX = "[context-compact]";
+const STOW_DIR = path.join(process.env.XDG_STATE_HOME || path.join(HOME, ".local", "state"), "paseo-plugins", "context-compact", "stow");
 
 async function listFiles(dir: string): Promise<string[]> {
   try {
@@ -92,14 +96,31 @@ export async function lastContextTokens(file: string): Promise<number | null> {
   }
 }
 
-const fill = (template: string, values: Record<string, string>): string =>
-  template.replace(/\{(\w+)\}/g, (m, k: string) => values[k] ?? m);
-
 // Paseo 0.13.0 (#7477) sends agent.turn_ended with an empty `timeline`; fetch the tail when it is empty.
 async function turnTimeline<T>(paseo: any, agentId: string, given: readonly T[], limit: number): Promise<readonly T[]> {
   if (given.length > 0) return given;
   const page = await paseo.agents.ref(agentId).timeline.refetch({ direction: "tail", limit, projection: "canonical" });
   return page.entries.map((entry: { item: T }) => entry.item);
+}
+
+const IDLE_POLL_MS = 500;
+const IDLE_SETTLE_MS = 1000;
+const IDLE_TIMEOUT_MS = 60_000;
+
+// After `/clear` the agent may flip running -> idle, or (a local command) never visibly leave idle. Wait a short
+// settle period, then require two consecutive idle reads.
+async function waitIdle(paseo: any, agentId: string): Promise<void> {
+  const ref = paseo.agents.ref(agentId);
+  const deadline = Date.now() + IDLE_TIMEOUT_MS;
+  await new Promise((r) => setTimeout(r, IDLE_SETTLE_MS));
+  let idleReads = 0;
+  while (Date.now() < deadline) {
+    await ref.refresh();
+    idleReads = ref.status === "idle" ? idleReads + 1 : 0;
+    if (idleReads >= 2) return;
+    await new Promise((r) => setTimeout(r, IDLE_POLL_MS));
+  }
+  throw new Error("agent did not become idle after /clear");
 }
 
 export default function contribute(server: PluginServerContext) {
@@ -115,9 +136,49 @@ export default function contribute(server: PluginServerContext) {
     }
   }
 
-  const removeOpen = server.before("agent.session_open", async ({ request }) => {
+  // stow_handoff: the plugin sends through `paseo.agents.ref(id).send`, which passes no `sourceAgentId`, so Paseo
+  // records no agent provenance and `/clear` reaches Claude as a command (see README).
+  let sdk: any = null;
+  const stow = createStow({
+    sendClear: (id) => sdk.agents.ref(id).send("/clear"),
+    waitIdle: (id) => waitIdle(sdk, id),
+    sendText: (id, text) => sdk.agents.ref(id).send(text),
+  }, {
+    dir: STOW_DIR,
+    fs: fsNode,
+    maxAgeMs: STOW_MAX_AGE_MS,
+    log: (m) => console.log(`[context-compact] ${m}`),
+  });
+  // Paseo's plugin API has no data dir, so notes live under the XDG state dir. Pick up notes left by a restart.
+  try {
+    const n = stow.load();
+    if (n > 0) console.log(`[context-compact] loaded ${n} stowed handoff note(s) from ${STOW_DIR}`);
+  } catch (error) {
+    console.error("[context-compact] loading stowed notes failed:", (error as Error)?.message ?? error);
+  }
+  const stowHandoff = defineAgentTool({
+    name: "stow_handoff",
+    title: "Stow handoff",
+    description:
+      "Stow a handoff note, then end your turn. When your turn ends, Paseo clears your context (/clear) and sends the note back to you as your next prompt. Calling it again replaces the earlier note.",
+    input: z.object({ text: z.string().describe("The handoff text to receive after the context is cleared") }),
+    execute({ text }, { agent, paseo }) {
+      sdk = paseo;
+      const r = stow.stow(agent.id, text);
+      return { text: r.message, isError: !r.ok };
+    },
+  });
+
+  const removeTools = server.addHook("agent.open.before", async ({ request }) => {
     const s = await current();
     if (!s || !s.enabled || !s.providers.includes(request.provider)) return undefined;
+    if (request.purpose !== "interactive") return undefined;
+    return { ...request, tools: [...request.tools, stowHandoff] };
+  });
+
+  const removeOpen = server.before("agent.session_open", async ({ request }) => {
+    const s = await current();
+    if (!s || !providerMatches(s, request.provider)) return undefined;
     if (request.purpose !== "interactive") return undefined;
     const env = compactEnv(s);
     console.log(
@@ -128,11 +189,18 @@ export default function contribute(server: PluginServerContext) {
 
   const removeTurn = server.on("agent.turn_ended", async (event, { paseo }) => {
     const { agent, outcome } = event;
+    sdk = paseo;
+    // Hooks have a 30 s timeout; run the clear -> idle -> text sequence detached. The entry is deleted
+    // synchronously, so a second turn_ended cannot repeat it.
+    if (stow.has(agent.id) && outcome.kind === "completed") {
+      stow.onTurnEnded(agent.id, outcome.kind).catch((error) =>
+        console.error(`[context-compact] ${agent.id.slice(0, 8)} stow handoff failed:`, (error as Error)?.message ?? error),
+      );
+      return;
+    }
     try {
       const s = await current();
-      if (!s || !s.enabled || s.handoffPct <= 0 || !s.providers.includes(agent.provider)) return;
-      if (agent.parentAgentId) return;
-      if (outcome.kind !== "completed") return;
+      if (!s || !turnEligible(s, agent, outcome.kind)) return;
 
       const file = await transcriptFor(agent.id);
       if (!file) return;
@@ -142,25 +210,21 @@ export default function contribute(server: PluginServerContext) {
         tokens = await lastContextTokens(file);
       }
       if (tokens === null) return;
-      const pct = Math.round((100 * tokens) / s.windowTokens);
+      const pct = contextPct(tokens, s.windowTokens);
 
-      if (pct < s.handoffPct) {
+      const verdict = classifyPct(pct, s, nudged.has(agent.id));
+      if (verdict === "rearm") {
         nudged.delete(agent.id); // compacted (or never got there): re-arm
         return;
       }
-      if (pct >= s.compactPct || nudged.has(agent.id)) return;
+      if (verdict === "skip") return;
       // The nudge's own turn ends here too; it is covered by `nudged`, but never answer a nudge with a nudge.
       const timeline = await turnTimeline(paseo, agent.id, event.timeline, 50);
       const lastPrompt = [...timeline].reverse().find((item) => item.type === "user_message") as { text?: string } | undefined;
-      if ((lastPrompt?.text ?? "").startsWith(PREFIX)) return;
+      if (isNudgeEcho(lastPrompt?.text)) return;
 
       nudged.add(agent.id);
-      const text = fill(s.handoffPrompt, {
-        pct: String(pct),
-        window: s.windowTokens.toLocaleString("en-US"),
-        compact: String(s.compactPct),
-      });
-      await paseo.agents.ref(agent.id).send(text.startsWith(PREFIX) ? text : `${PREFIX} ${text}`);
+      await paseo.agents.ref(agent.id).send(buildNudgeText(s, pct));
       console.log(`[context-compact] ${agent.id.slice(0, 8)} at ${pct}% (${tokens} tokens): handoff nudge sent`);
     } catch (error) {
       console.error(`[context-compact] ${agent.id.slice(0, 8)} turn_ended failed:`, (error as Error)?.message ?? error);
@@ -169,6 +233,7 @@ export default function contribute(server: PluginServerContext) {
 
   return () => {
     removeOpen();
+    removeTools();
     removeTurn();
   };
 }
