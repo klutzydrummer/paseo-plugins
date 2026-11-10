@@ -1,7 +1,9 @@
-import type { PluginServerContext } from "@getpaseo/plugin/server";
+import { defineAgentTool, type PluginServerContext } from "@getpaseo/plugin/server";
+import { z } from "zod";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createStow } from "./shared/stow";
 import { compactEnv, contextCompactSettings, type ContextCompactSettings } from "./shared/settings";
 import { buildNudgeText, classifyPct, contextPct, isNudgeEcho, providerMatches, turnEligible } from "./shared/decision";
 
@@ -99,6 +101,26 @@ async function turnTimeline<T>(paseo: any, agentId: string, given: readonly T[],
   return page.entries.map((entry: { item: T }) => entry.item);
 }
 
+const IDLE_POLL_MS = 500;
+const IDLE_SETTLE_MS = 1000;
+const IDLE_TIMEOUT_MS = 60_000;
+
+// After `/clear` the agent may flip running -> idle, or (a local command) never visibly leave idle. Wait a short
+// settle period, then require two consecutive idle reads.
+async function waitIdle(paseo: any, agentId: string): Promise<void> {
+  const ref = paseo.agents.ref(agentId);
+  const deadline = Date.now() + IDLE_TIMEOUT_MS;
+  await new Promise((r) => setTimeout(r, IDLE_SETTLE_MS));
+  let idleReads = 0;
+  while (Date.now() < deadline) {
+    await ref.refresh();
+    idleReads = ref.status === "idle" ? idleReads + 1 : 0;
+    if (idleReads >= 2) return;
+    await new Promise((r) => setTimeout(r, IDLE_POLL_MS));
+  }
+  throw new Error("agent did not become idle after /clear");
+}
+
 export default function contribute(server: PluginServerContext) {
   const settingsHandle = server.registerSettings(contextCompactSettings);
   const nudged = new Set<string>();
@@ -111,6 +133,34 @@ export default function contribute(server: PluginServerContext) {
       return null;
     }
   }
+
+  // stow_handoff: the plugin sends through `paseo.agents.ref(id).send`, which passes no `sourceAgentId`, so Paseo
+  // records no agent provenance and `/clear` reaches Claude as a command (see README).
+  let sdk: any = null;
+  const stow = createStow({
+    sendClear: (id) => sdk.agents.ref(id).send("/clear"),
+    waitIdle: (id) => waitIdle(sdk, id),
+    sendText: (id, text) => sdk.agents.ref(id).send(text),
+  });
+  const stowHandoff = defineAgentTool({
+    name: "stow_handoff",
+    title: "Stow handoff",
+    description:
+      "Stow a handoff note, then end your turn. When your turn ends, Paseo clears your context (/clear) and sends the note back to you as your next prompt. Calling it again replaces the earlier note.",
+    input: z.object({ text: z.string().describe("The handoff text to receive after the context is cleared") }),
+    execute({ text }, { agent, paseo }) {
+      sdk = paseo;
+      const r = stow.stow(agent.id, text);
+      return { text: r.message, isError: !r.ok };
+    },
+  });
+
+  const removeTools = server.addHook("agent.open.before", async ({ request }) => {
+    const s = await current();
+    if (!s || !s.enabled || !s.providers.includes(request.provider)) return undefined;
+    if (request.purpose !== "interactive") return undefined;
+    return { ...request, tools: [...request.tools, stowHandoff] };
+  });
 
   const removeOpen = server.before("agent.session_open", async ({ request }) => {
     const s = await current();
@@ -125,6 +175,15 @@ export default function contribute(server: PluginServerContext) {
 
   const removeTurn = server.on("agent.turn_ended", async (event, { paseo }) => {
     const { agent, outcome } = event;
+    sdk = paseo;
+    // Hooks have a 30 s timeout; run the clear -> idle -> text sequence detached. The entry is deleted
+    // synchronously, so a second turn_ended cannot repeat it.
+    if (stow.has(agent.id) && outcome.kind === "completed") {
+      stow.onTurnEnded(agent.id, outcome.kind).catch((error) =>
+        console.error(`[context-compact] ${agent.id.slice(0, 8)} stow handoff failed:`, (error as Error)?.message ?? error),
+      );
+      return;
+    }
     try {
       const s = await current();
       if (!s || !turnEligible(s, agent, outcome.kind)) return;
@@ -160,6 +219,7 @@ export default function contribute(server: PluginServerContext) {
 
   return () => {
     removeOpen();
+    removeTools();
     removeTurn();
   };
 }
