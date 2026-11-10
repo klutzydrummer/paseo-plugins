@@ -140,4 +140,5 @@ export default function contribute(client: PluginClientContext) {
     icon: "Minimize2",
     Component: SettingsScreen,
   });
+  return () => {};
 }

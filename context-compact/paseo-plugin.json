@@ -6,6 +6,6 @@
     "assets/nudge.png"
   ],
   "requirements": {
-    "paseo": ">=0.12.0"
+    "paseo": ">=0.15.0"
   }
 }
