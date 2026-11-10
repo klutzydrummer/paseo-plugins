@@ -3,7 +3,8 @@ import { z } from "zod";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createStow } from "./shared/stow";
+import fsNode from "node:fs";
+import { createStow, STOW_MAX_AGE_MS } from "./shared/stow";
 import { compactEnv, contextCompactSettings, type ContextCompactSettings } from "./shared/settings";
 import { buildNudgeText, classifyPct, contextPct, isNudgeEcho, providerMatches, turnEligible } from "./shared/decision";
 
@@ -30,6 +31,7 @@ const AGENTS_DIR = path.join(process.env.PASEO_HOME || path.join(HOME, ".paseo")
 const CLAUDE_PROJECTS = path.join(HOME, ".claude", "projects");
 const TAIL_BYTES = 512 * 1024;
 const FLUSH_RETRY_MS = 1500;
+const STOW_DIR = path.join(process.env.XDG_STATE_HOME || path.join(HOME, ".local", "state"), "paseo-plugins", "context-compact", "stow");
 
 async function listFiles(dir: string): Promise<string[]> {
   try {
@@ -141,7 +143,19 @@ export default function contribute(server: PluginServerContext) {
     sendClear: (id) => sdk.agents.ref(id).send("/clear"),
     waitIdle: (id) => waitIdle(sdk, id),
     sendText: (id, text) => sdk.agents.ref(id).send(text),
+  }, {
+    dir: STOW_DIR,
+    fs: fsNode,
+    maxAgeMs: STOW_MAX_AGE_MS,
+    log: (m) => console.log(`[context-compact] ${m}`),
   });
+  // Paseo's plugin API has no data dir, so notes live under the XDG state dir. Pick up notes left by a restart.
+  try {
+    const n = stow.load();
+    if (n > 0) console.log(`[context-compact] loaded ${n} stowed handoff note(s) from ${STOW_DIR}`);
+  } catch (error) {
+    console.error("[context-compact] loading stowed notes failed:", (error as Error)?.message ?? error);
+  }
   const stowHandoff = defineAgentTool({
     name: "stow_handoff",
     title: "Stow handoff",
