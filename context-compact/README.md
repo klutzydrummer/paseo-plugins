@@ -14,7 +14,7 @@ Requires Paseo >=0.12.0.
 
 ## stow_handoff tool
 
-Agents get `stow_handoff(text)` (Paseo >= 0.15.3). The calling agent's id comes from the tool context (`context.agent.id`), never a parameter. On that agent's next completed `agent.turn_ended` the plugin sends `/clear`, waits for idle (settle 1 s, two idle reads, 60 s timeout), then sends the text; the entry is deleted before sending. The sequence runs detached because hooks time out after 30 s. Sends go through `paseo.agents.ref(id).send(...)` without `sourceAgentId`, the only SDK option that carries agent provenance (`SendMessageOptions` in `@getpaseo/client`), so no caller header is expected. Not yet verified live.
+Agents get `stow_handoff(text)` (Paseo >= 0.15.0). The calling agent's id comes from the tool context (`context.agent.id`), never a parameter. On that agent's next completed `agent.turn_ended` the plugin sends `/clear`, waits for idle (settle 1 s, two idle reads, 60 s timeout), then sends the text; the entry is deleted before sending. The sequence runs detached because hooks time out after 30 s. Sends go through `paseo.agents.ref(id).send(...)` without `sourceAgentId`, the only SDK option that carries agent provenance (`SendMessageOptions` in `@getpaseo/client`), so no caller header is expected. Verified live on 2026-11-10 (plain claude haiku-5-5, plugin loaded from this branch): the agent called `stow_handoff` and ended its turn, `/clear` ran as a command ("Claude switched to a new session"), the stowed text arrived as the next user message, the agent had lost earlier memory and kept its Paseo ID, and no caller header arrived.
 
 ## Develop
 

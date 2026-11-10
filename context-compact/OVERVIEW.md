@@ -28,7 +28,7 @@ With the defaults, Claude Code compacts at 60% of 1M tokens (about 600k; Claude 
 
 ## Limits
 
-- `stow_handoff` needs Paseo 0.15.3 or newer. It is attached when a session opens, so agents already running get it the next time they open. The note is kept in memory only; a daemon restart before the turn ends loses it. `/clear` is sent without agent-origin markup, but that depends on the daemon; check it on your setup.
+- `stow_handoff` needs Paseo 0.15.0 or newer. It is attached when a session opens, and sessions that are already running get it after `paseo plugin reload` (verified live). The note is kept in memory only; a daemon restart before the turn ends loses it. `/clear` is sent without agent-origin markup, but that depends on the daemon; check it on your setup.
 - A change applies to a chat the next time it opens. A running Claude process keeps the settings it started with.
 - Claude Code chats started outside Paseo are not affected.
 - An `env` entry for the same variables in `~/.claude/settings.json` is applied by Claude Code after launch and overrides this plugin.
