@@ -174,12 +174,15 @@ export default function contribute(server: PluginServerContext) {
 
   const removeTools = server.addHook("agent.open.before", async ({ request }) => {
     // turn_ended's agent carries no labels; record them here (fires on create/resume/refresh/import).
-    labelStore.record((request as any).agentId, (request as any).labels);
+    labelStore.record(request.agentId, request.labels);
     const s = await current();
     if (!s || !s.enabled || !s.providers.includes(request.provider)) return undefined;
     if (request.purpose !== "interactive") return undefined;
     return { ...request, tools: [...request.tools, stowHandoff] };
   });
+
+  // A closed agent's labels are re-recorded by agent.open.before on resume, so dropping them here cannot lose data.
+  const removeClose = server.on("agent.closed", async ({ agent }) => labelStore.forget(agent.id));
 
   const removeOpen = server.before("agent.session_open", async ({ request }) => {
     const s = await current();
@@ -240,5 +243,6 @@ export default function contribute(server: PluginServerContext) {
     removeOpen();
     removeTools();
     removeTurn();
+    removeClose();
   };
 }
