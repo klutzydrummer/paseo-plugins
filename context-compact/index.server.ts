@@ -4,9 +4,10 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import fsNode from "node:fs";
+import { createLabelStore } from "./shared/labels";
 import { createStow, STOW_MAX_AGE_MS } from "./shared/stow";
 import { compactEnv, contextCompactSettings, type ContextCompactSettings } from "./shared/settings";
-import { buildNudgeText, classifyPct, contextPct, isNudgeEcho, providerMatches, turnEligible } from "./shared/decision";
+import { buildNudgeText, type NudgeLevel, classifyPct, contextPct, isNudgeEcho, providerMatches, turnEligible } from "./shared/decision";
 
 // context-compact — Claude Code auto-compaction threshold for every Claude session Paseo opens, plus an optional
 // "update your notes before compaction" nudge.
@@ -18,8 +19,9 @@ import { buildNudgeText, classifyPct, contextPct, isNudgeEcho, providerMatches, 
 //  2. `on("agent.turn_ended")` — reads the context size of the session's LAST API call from its transcript
 //     (~/.claude/projects/*/<sessionId>.jsonl, the same source cache-meter reads) and, once it passes handoffPct,
 //     sends the agent one prompt asking it to update its durable state before compaction. Re-armed when the
-//     context falls back under handoffPct (i.e. after a compaction). Top-level agents only: a sub-agent's state
-//     belongs to its parent.
+//     context falls back under handoffPct (i.e. after a compaction). Top-level agents, plus child agents carrying the
+//     opt-in label (nudgeLabelKey=nudgeLabelValue, default studio.role=mm). Two steps: a soft nudge at handoffPct,
+//     a hard one at hardHandoffPct; each fires once per arm.
 //
 // What it cannot see: a Claude Code chat started outside Paseo (a plain terminal `claude`) never passes through
 // session_open — that one is governed by ~/.claude/settings.json `env` alone. And a `env` entry for the same
@@ -125,7 +127,8 @@ async function waitIdle(paseo: any, agentId: string): Promise<void> {
 
 export default function contribute(server: PluginServerContext) {
   const settingsHandle = server.registerSettings(contextCompactSettings);
-  const nudged = new Set<string>();
+  const nudged = new Map<string, NudgeLevel>();
+  const labelStore = createLabelStore();
 
   async function current(): Promise<ContextCompactSettings | null> {
     try {
@@ -170,11 +173,16 @@ export default function contribute(server: PluginServerContext) {
   });
 
   const removeTools = server.addHook("agent.open.before", async ({ request }) => {
+    // turn_ended's agent carries no labels; record them here (fires on create/resume/refresh/import).
+    labelStore.record(request.agentId, request.labels);
     const s = await current();
     if (!s || !s.enabled || !s.providers.includes(request.provider)) return undefined;
     if (request.purpose !== "interactive") return undefined;
     return { ...request, tools: [...request.tools, stowHandoff] };
   });
+
+  // A closed agent's labels are re-recorded by agent.open.before on resume, so dropping them here cannot lose data.
+  const removeClose = server.on("agent.closed", async ({ agent }) => labelStore.forget(agent.id));
 
   const removeOpen = server.before("agent.session_open", async ({ request }) => {
     const s = await current();
@@ -200,7 +208,7 @@ export default function contribute(server: PluginServerContext) {
     }
     try {
       const s = await current();
-      if (!s || !turnEligible(s, agent, outcome.kind)) return;
+      if (!s || !turnEligible(s, labelStore.withLabels(agent), outcome.kind)) return;
 
       const file = await transcriptFor(agent.id);
       if (!file) return;
@@ -212,7 +220,7 @@ export default function contribute(server: PluginServerContext) {
       if (tokens === null) return;
       const pct = contextPct(tokens, s.windowTokens);
 
-      const verdict = classifyPct(pct, s, nudged.has(agent.id));
+      const verdict = classifyPct(pct, s, nudged.get(agent.id) ?? 0);
       if (verdict === "rearm") {
         nudged.delete(agent.id); // compacted (or never got there): re-arm
         return;
@@ -223,9 +231,9 @@ export default function contribute(server: PluginServerContext) {
       const lastPrompt = [...timeline].reverse().find((item) => item.type === "user_message") as { text?: string } | undefined;
       if (isNudgeEcho(lastPrompt?.text)) return;
 
-      nudged.add(agent.id);
-      await paseo.agents.ref(agent.id).send(buildNudgeText(s, pct));
-      console.log(`[context-compact] ${agent.id.slice(0, 8)} at ${pct}% (${tokens} tokens): handoff nudge sent`);
+      nudged.set(agent.id, verdict === "hard" ? 2 : 1);
+      await paseo.agents.ref(agent.id).send(buildNudgeText(s, pct, verdict));
+      console.log(`[context-compact] ${agent.id.slice(0, 8)} at ${pct}% (${tokens} tokens): ${verdict} handoff nudge sent`);
     } catch (error) {
       console.error(`[context-compact] ${agent.id.slice(0, 8)} turn_ended failed:`, (error as Error)?.message ?? error);
     }
@@ -235,5 +243,6 @@ export default function contribute(server: PluginServerContext) {
     removeOpen();
     removeTools();
     removeTurn();
+    removeClose();
   };
 }
