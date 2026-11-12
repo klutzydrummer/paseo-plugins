@@ -25,7 +25,7 @@ Both texts tell the agent to hand off by itself, without asking the user: write 
 
 ## Which agents are nudged
 
-Top-level agents always. A child agent (one with a parent) only if it carries an opt-in label: `nudgeLabelKey` = `nudgeLabelValue`, default `studio.role` = `mm` (e.g. a middle manager spawned with `--label studio.role=mm`). Children without that label (workers) are never nudged. An empty `nudgeLabelKey` turns the child opt-in off. Existing saved configs keep working: the new keys take their defaults.
+Top-level agents always. A child agent (one with a parent) only if it carries an opt-in label: `nudgeLabelKey` = `nudgeLabelValue`, default `studio.role` = `mm` (e.g. a middle manager spawned with `--label studio.role=mm`). Children without that label (workers) are never nudged. Labels are not on the `agent.turn_ended` event, so the plugin records them from the `agent.open.before` request (create/resume/refresh/import) and looks them up at turn end; an agent whose labels were never recorded counts as unlabelled. An empty `nudgeLabelKey` turns the child opt-in off. Existing saved configs keep working: the new keys take their defaults.
 
 ## stow_handoff tool
 

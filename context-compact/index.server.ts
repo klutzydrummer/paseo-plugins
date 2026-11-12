@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import fsNode from "node:fs";
+import { createLabelStore } from "./shared/labels";
 import { createStow, STOW_MAX_AGE_MS } from "./shared/stow";
 import { compactEnv, contextCompactSettings, type ContextCompactSettings } from "./shared/settings";
 import { buildNudgeText, type NudgeLevel, classifyPct, contextPct, isNudgeEcho, providerMatches, turnEligible } from "./shared/decision";
@@ -127,6 +128,7 @@ async function waitIdle(paseo: any, agentId: string): Promise<void> {
 export default function contribute(server: PluginServerContext) {
   const settingsHandle = server.registerSettings(contextCompactSettings);
   const nudged = new Map<string, NudgeLevel>();
+  const labelStore = createLabelStore();
 
   async function current(): Promise<ContextCompactSettings | null> {
     try {
@@ -171,6 +173,8 @@ export default function contribute(server: PluginServerContext) {
   });
 
   const removeTools = server.addHook("agent.open.before", async ({ request }) => {
+    // turn_ended's agent carries no labels; record them here (fires on create/resume/refresh/import).
+    labelStore.record((request as any).agentId, (request as any).labels);
     const s = await current();
     if (!s || !s.enabled || !s.providers.includes(request.provider)) return undefined;
     if (request.purpose !== "interactive") return undefined;
@@ -201,7 +205,7 @@ export default function contribute(server: PluginServerContext) {
     }
     try {
       const s = await current();
-      if (!s || !turnEligible(s, agent, outcome.kind)) return;
+      if (!s || !turnEligible(s, labelStore.withLabels(agent), outcome.kind)) return;
 
       const file = await transcriptFor(agent.id);
       if (!file) return;
