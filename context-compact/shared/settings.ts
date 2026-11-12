@@ -17,13 +17,33 @@ export const ContextCompactSettingsSchema = z.object({
   /** The window the % applies to. 1,000,000 = the 1M models' full window. */
   windowTokens: z.number().int().min(50_000).max(2_000_000).default(1_000_000),
   /**
-   * Ask a top-level agent to update its handoff once its context passes this % of windowTokens (0 = never).
-   * BEST-EFFORT: checked at turn end only, so a single long turn (large tool outputs) can cross both this and the
-   * compaction threshold before it is checked. Pair it with a Claude Code PostCompact/SessionStart hook if you need
-   * a guarantee.
+   * Soft nudge: once an eligible agent's context passes this % of windowTokens, ask it to finish its current step and
+   * hand off at the next clean stopping point (0 = no nudges at all). BEST-EFFORT: checked at turn end only, so a
+   * single long turn (large tool outputs) can cross this, hardHandoffPct and the compaction threshold before it is
+   * checked. Pair it with a Claude Code PostCompact/SessionStart hook if you need a guarantee.
    */
-  handoffPct: z.number().int().min(0).max(100).default(45),
+  handoffPct: z.number().int().min(0).max(100).default(50),
+  /** Hard nudge: past this % of windowTokens, tell the agent to hand off now. Fires once per arm, like the soft one. */
+  hardHandoffPct: z.number().int().min(0).max(100).default(75),
+  /**
+   * Opt-in label for child agents: a child (parentAgentId set) is nudged only when it carries this label key with
+   * this value (e.g. middle managers spawned with `studio.role=mm`). Top-level agents are always eligible; children
+   * without the label never are. Empty nudgeLabelKey disables the child opt-in.
+   */
+  nudgeLabelKey: z.string().default("studio.role"),
+  nudgeLabelValue: z.string().default("mm"),
+  /** Soft nudge text. {pct} {window} {compact} are substituted. */
   handoffPrompt: z
+    .string()
+    .default(
+      "[context-compact] Your context is at {pct}% of {window} tokens; auto-compaction runs at {compact}%. " +
+        "Finish the current step, start no new phase, and self-hand off at the next clean stopping point without " +
+        "asking the user: write your state file and a handoff file, call stow_handoff(<short pointer text>) saying " +
+        "the handoff file is the source of truth and wins on any conflict, then end your turn. If stow_handoff is " +
+        "unavailable, write the handoff file and report its path to your parent (the user, if you are top level).",
+    ),
+  /** Hard nudge text (same substitutions). */
+  hardHandoffPrompt: z
     .string()
     .default(
       "[context-compact] Your context is at {pct}% of {window} tokens; auto-compaction runs at {compact}%. " +
