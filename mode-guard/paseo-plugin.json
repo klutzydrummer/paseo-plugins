@@ -1,0 +1,8 @@
+{
+  "id": "mode-guard",
+  "name": "Mode Guard",
+  "description": "Rewrites the \"Always Ask\" permission mode (modeId \"default\") to \"auto\" when an agent is created, so unattended agents do not stall on permission prompts.",
+  "requirements": {
+    "paseo": ">=0.15.0"
+  }
+}

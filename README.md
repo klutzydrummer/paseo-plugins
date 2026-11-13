@@ -8,6 +8,7 @@ Plugins for [Paseo](https://paseo.sh).
 | [Workflow Progress](workflow-progress) | Claude Code Workflow steps as cards in the agent's timeline | `paseo plugin add git:sbhas2k/paseo-plugins:workflow-progress` |
 | [Context Compact](context-compact) | Claude Code auto-compaction threshold per session, with a save-your-notes nudge | `paseo plugin add git:sbhas2k/paseo-plugins:context-compact` |
 | [Agent Rescue](agent-rescue) | One-click rescue for agents whose session died ("A foreground turn is already active"): reload with retry, guarded provider restart | `paseo plugin add git:sbhas2k/paseo-plugins:agent-rescue` |
+| [Mode Guard](mode-guard) | Rewrites Always Ask (`default`) to `auto` on agent create | `paseo plugin add git:sbhas2k/paseo-plugins:mode-guard` |
 | [Remote Browser](remote-browser) | A real Chrome on the Paseo host, shown and driven from a screen in Paseo: `localhost` is the host, websites see the host's IP | `paseo plugin add git:sbhas2k/paseo-plugins:remote-browser` |
 | [agy rotator (Windows)](agy-rotator-windows) | Several Antigravity (`agy`) sign-ins on Windows, rotated in your order when one runs low; live 5-hour quota bars per account | `paseo plugin add git:sbhas2k/paseo-plugins:agy-rotator-windows` |
 
