@@ -1,0 +1,8 @@
+{
+  "id": "resume-guard",
+  "name": "Resume Guard",
+  "description": "Blocks opening (resuming) an agent whose snapshot shows status \"error\" with a context above a token threshold, telling the sender to write a handoff file and spawn a fresh agent instead.",
+  "requirements": {
+    "paseo": ">=0.15.0"
+  }
+}
