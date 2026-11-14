@@ -128,6 +128,9 @@ async function waitIdle(paseo: any, agentId: string): Promise<void> {
 export default function contribute(server: PluginServerContext) {
   const settingsHandle = server.registerSettings(contextCompactSettings);
   const nudged = new Map<string, NudgeLevel>();
+  // Agents whose stow delivery (/clear -> idle -> text) is in flight. The /clear ends a turn, so turn_ended fires again
+  // while the transcript is still the stale pre-clear one; a nudge check then would hit the fresh session.
+  const delivering = new Set<string>();
   const labelStore = createLabelStore();
 
   async function current(): Promise<ContextCompactSettings | null> {
@@ -201,11 +204,20 @@ export default function contribute(server: PluginServerContext) {
     // Hooks have a 30 s timeout; run the clear -> idle -> text sequence detached. The entry is deleted
     // synchronously, so a second turn_ended cannot repeat it.
     if (stow.has(agent.id) && outcome.kind === "completed") {
-      stow.onTurnEnded(agent.id, outcome.kind).catch((error) =>
-        console.error(`[context-compact] ${agent.id.slice(0, 8)} stow handoff failed:`, (error as Error)?.message ?? error),
-      );
+      delivering.add(agent.id); // synchronously, before the /clear can end a turn
+      stow
+        .onTurnEnded(agent.id, outcome.kind)
+        .then((delivered) => {
+          // The fresh context starts clean: re-arm. Not on failure, so the next nudge can still recover.
+          if (delivered) nudged.delete(agent.id);
+        })
+        .catch((error) =>
+          console.error(`[context-compact] ${agent.id.slice(0, 8)} stow handoff failed:`, (error as Error)?.message ?? error),
+        )
+        .finally(() => delivering.delete(agent.id));
       return;
     }
+    if (delivering.has(agent.id)) return; // the /clear's own turn end: stale transcript, no nudge check
     try {
       const s = await current();
       if (!s || !turnEligible(s, labelStore.withLabels(agent), outcome.kind)) return;
