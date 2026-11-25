@@ -1,0 +1,6 @@
+{
+  "id": "idle-worker-reminder",
+  "name": "Idle worker reminder",
+  "description": "Warns a worker's parent manager once when the worker has sat idle after a finished turn, so accepted workers get archived.",
+  "requirements": { "paseo": ">=0.15.0" }
+}
