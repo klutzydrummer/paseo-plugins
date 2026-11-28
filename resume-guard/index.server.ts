@@ -64,7 +64,16 @@ function saveAllowedAt(file: string, map: Map<string, number>): void {
  * timeline yields no evidence, so the open stays blocked as an ordinary resume (fail closed).
  */
 async function limitEvidence(ref: any, agentId: string, timeoutMs: number = EVIDENCE_TIMELINE_TIMEOUT_MS): Promise<boolean> {
-  if (typeof ref.lastError === "string" && hasLimitEvidence([ref.lastError])) return true;
+  const t0 = Date.now();
+  const id8 = agentId.slice(0, 8);
+  const le = ref.lastError;
+  console.log(
+    `[resume-guard] ${id8} evidence: lastError ${typeof le}${typeof le === "string" ? ` "${le.slice(0, 80).replace(/\s+/g, " ")}"` : ""}`,
+  );
+  if (typeof le === "string" && hasLimitEvidence([le])) {
+    console.log(`[resume-guard] ${id8} evidence: decided by lastError in ${Date.now() - t0} ms`);
+    return true;
+  }
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const read = ref.timeline.refetch({ direction: "tail", limit: EVIDENCE_TIMELINE_ITEMS, projection: "canonical" });
@@ -74,13 +83,21 @@ async function limitEvidence(ref: any, agentId: string, timeoutMs: number = EVID
     });
     const page = await Promise.race([read, timeout]);
     const texts: string[] = [];
-    for (const entry of page.entries as Array<{ item: Record<string, unknown> }>) {
+    const entries = page.entries as Array<{ item: Record<string, unknown> }>;
+    const shape = entries
+      .slice(-5)
+      .map((e) => `${String(e.item?.type)}[${Object.entries(e.item ?? {}).map(([k, v]) => `${k}:${typeof v}`).join(",")}]`)
+      .join(" | ");
+    console.log(`[resume-guard] ${id8} evidence: timeline ${entries.length} entries in ${Date.now() - t0} ms; last5 ${shape}`);
+    for (const entry of entries) {
       for (const key of ["text", "message", "error"]) {
         const value = entry.item?.[key];
         if (typeof value === "string") texts.push(value);
       }
     }
-    return hasLimitEvidence(texts);
+    const found = hasLimitEvidence(texts);
+    console.log(`[resume-guard] ${id8} evidence: timeline decided ${found} (${texts.length} strings checked)`);
+    return found;
   } catch (error) {
     console.error(
       `[resume-guard] ${agentId.slice(0, 8)} no limit evidence (timeline unreadable or too slow), blocking as ordinary resume:`,
