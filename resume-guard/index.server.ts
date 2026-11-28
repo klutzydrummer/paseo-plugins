@@ -1,16 +1,81 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { buildDenyMessage, logLine, approxK, resolveThreshold, shouldBlockResume, type ResumeSnapshot } from "./shared/decision.ts";
-import { DEFAULT_THRESHOLD_TOKENS, resumeGuardSettings } from "./shared/settings.ts";
+import {
+  buildDenyMessage,
+  hasLimitEvidence,
+  logLine,
+  approxK,
+  resolveRotationMinutes,
+  resolveThreshold,
+  rotationLogLine,
+  shouldAllowRotation,
+  shouldBlockResume,
+  type ResumeSnapshot,
+} from "./shared/decision.ts";
+import { DEFAULT_ROTATION_EXEMPT_MINUTES, DEFAULT_THRESHOLD_TOKENS, resumeGuardSettings } from "./shared/settings.ts";
 
 // resume-guard: one agent.open.before hook. An open (create, resume, refresh, import) is blocked when the agent
 // snapshot has status "error" and its recorded context usage is above the threshold, because resuming such an
 // agent would pay for its whole context again. The deny message tells the sender to write a handoff file and
 // spawn a fresh agent instead.
 //
+// Rotation exemption: ZeroSub reloads (reason "refresh") an agent that hit an account limit, and that agent is in
+// status "error". One such refresh per agent is allowed when its recent timeline carries a CLI limit notice, then
+// blocked again for rotationExemptMinutes. Evidence is the timeline text, not a ZeroSub RPC: the plugin SDK has no
+// documented plugin-to-plugin call. allowedAt is kept in memory and in a small state file so a daemon restart
+// does not grant a second exemption.
+//
 // Known limit: a throw from agent.open.before surfaces to the client as the generic
 // "Plugin resume-guard agent.open.before failed: <message>" failure text, not a custom deny message. The whole
 // reason lives in the thrown error text for that reason.
-export default function contribute(server: PluginServerContext) {
+const STATE_FILE = path.join(
+  process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"),
+  "paseo-plugins",
+  "resume-guard",
+  "rotation-allowed.json",
+);
+const EVIDENCE_TIMELINE_ITEMS = 20;
+
+function loadAllowedAt(file: string): Map<string, number> {
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    return new Map(Object.entries(raw).filter((e): e is [string, number] => typeof e[1] === "number"));
+  } catch {
+    return new Map();
+  }
+}
+
+function saveAllowedAt(file: string, map: Map<string, number>): void {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(Object.fromEntries(map)));
+  } catch (error) {
+    console.error("[resume-guard] saving rotation state failed:", (error as Error)?.message ?? error);
+  }
+}
+
+/** Text of the tail of the agent's timeline; unreadable timeline yields no evidence. */
+async function timelineTexts(ref: any): Promise<string[]> {
+  try {
+    const page = await ref.timeline.refetch({ direction: "tail", limit: EVIDENCE_TIMELINE_ITEMS, projection: "canonical" });
+    const texts: string[] = [];
+    for (const entry of page.entries as Array<{ item: Record<string, unknown> }>) {
+      for (const key of ["text", "message", "error"]) {
+        const value = entry.item?.[key];
+        if (typeof value === "string") texts.push(value);
+      }
+    }
+    return texts;
+  } catch (error) {
+    console.error("[resume-guard] timeline unreadable, no limit evidence:", (error as Error)?.message ?? error);
+    return [];
+  }
+}
+
+export default function contribute(server: PluginServerContext, stateFile: string = STATE_FILE) {
+  const allowedAt = loadAllowedAt(stateFile);
   const settingsHandle = server.registerSettings(resumeGuardSettings);
 
   async function thresholdTokens(): Promise<number> {
@@ -26,11 +91,20 @@ export default function contribute(server: PluginServerContext) {
     }
   }
 
+  async function rotationWindowMs(): Promise<number> {
+    try {
+      return resolveRotationMinutes(await settingsHandle.read(), DEFAULT_ROTATION_EXEMPT_MINUTES) * 60_000;
+    } catch {
+      return DEFAULT_ROTATION_EXEMPT_MINUTES * 60_000;
+    }
+  }
+
   const off = server.addHook("agent.open.before", async ({ request }, { paseo }) => {
     const threshold = await thresholdTokens();
     let snapshot: ResumeSnapshot;
+    let ref: any;
     try {
-      const ref = paseo.agents.ref(request.agentId);
+      ref = paseo.agents.ref(request.agentId);
       await ref.refresh();
       snapshot = { status: ref.status, lastUsage: ref.lastUsage };
     } catch (error) {
@@ -51,6 +125,24 @@ export default function contribute(server: PluginServerContext) {
       return undefined;
     }
     const tokens = snapshot.lastUsage?.contextWindowUsedTokens ?? 0;
+    if (request.reason === "refresh") {
+      const now = Date.now();
+      const allowed = shouldAllowRotation({
+        reason: request.reason,
+        status: snapshot.status,
+        archived: Boolean(ref.archivedAt),
+        limitEvidence: hasLimitEvidence(await timelineTexts(ref)),
+        lastAllowedAt: allowedAt.get(request.agentId),
+        now,
+        windowMs: await rotationWindowMs(),
+      });
+      if (allowed) {
+        allowedAt.set(request.agentId, now);
+        saveAllowedAt(stateFile, allowedAt);
+        console.log(rotationLogLine(request.agentId, tokens));
+        return undefined;
+      }
+    }
     console.log(logLine(request.agentId, tokens, threshold));
     throw new Error(buildDenyMessage(request.agentId, tokens, threshold));
   });

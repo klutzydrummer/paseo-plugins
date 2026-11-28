@@ -48,3 +48,49 @@ export function resolveThreshold(read: unknown, fallback: number): number {
   const tokens = rec.values?.thresholdTokens;
   return typeof tokens === "number" ? tokens : fallback;
 }
+
+// --- One-shot limit-rotation exemption -------------------------------------------------------------------
+// ZeroSub moves an agent that hit an account limit by reloading it (reason "refresh"). The agent is in status
+// "error" at that moment, so the guard would block the reload. The payload cannot tell a rotation from a manual
+// refresh, so the guard asks for evidence: the agent's recent timeline carries the CLI's own limit notice.
+
+/** CLI limit notices ZeroSub documents: "You've hit your 5-hour limit", "You've reached your Fable 5.2 limit", "The usage limit has been reached". */
+const LIMIT_NOTICE = /\byou['\u2019]ve (?:hit|reached) your [^\n]{0,60}?limit\b|\busage limit has been reached\b/i;
+
+/** True when any text looks like a CLI account-limit notice. */
+export function hasLimitEvidence(texts: readonly string[]): boolean {
+  return texts.some((text) => LIMIT_NOTICE.test(text));
+}
+
+export interface RotationInput {
+  reason: string | undefined;
+  status: string | null | undefined;
+  archived: boolean;
+  limitEvidence: boolean;
+  /** Epoch ms of the last rotation allow for this agent, if any. */
+  lastAllowedAt: number | undefined;
+  now: number;
+  windowMs: number;
+}
+
+/** Allow exactly when a refresh of a non-archived errored agent has limit evidence and no rotation allow happened within the window. */
+export function shouldAllowRotation(input: RotationInput): boolean {
+  if (input.reason !== "refresh" || input.status !== "error" || input.archived || !input.limitEvidence) return false;
+  return input.lastAllowedAt === undefined || input.now - input.lastAllowedAt >= input.windowMs;
+}
+
+export function rotationLogLine(agentId: string, tokens: number | undefined): string {
+  return `[resume-guard] ${agentId.slice(0, 8)} rotation allow: refresh of errored agent with limit notice` +
+    ` (${typeof tokens === "number" ? approxK(tokens) : "no usage recorded"})`;
+}
+
+/** The exemption window. Unreadable/invalid settings fall back to the default. */
+export function resolveRotationMinutes(read: unknown, fallback: number): number {
+  const rec = (typeof read === "object" && read !== null ? read : null) as {
+    status?: unknown;
+    values?: { rotationExemptMinutes?: unknown } | null;
+  } | null;
+  if (!rec || rec.status !== "ready") return fallback;
+  const minutes = rec.values?.rotationExemptMinutes;
+  return typeof minutes === "number" && minutes >= 0 ? minutes : fallback;
+}

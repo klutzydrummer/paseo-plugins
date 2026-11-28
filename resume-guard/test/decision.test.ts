@@ -2,6 +2,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  hasLimitEvidence,
+  resolveRotationMinutes,
+  shouldAllowRotation,
   approxK,
   buildDenyMessage,
   resolveThreshold,
@@ -94,4 +97,37 @@ test("approxK rounds like ~Nk", () => {
 test("schema default is 30000", () => {
   assert.equal(ResumeGuardSettingsSchema.parse({}).thresholdTokens, 30_000);
   assert.equal(DEFAULT_SETTINGS.thresholdTokens, DEFAULT_THRESHOLD_TOKENS);
+});
+
+// Rotation exemption (pure logic).
+
+test("hasLimitEvidence matches the CLI limit notices, not ordinary text", () => {
+  assert.equal(hasLimitEvidence(["You've hit your 5-hour limit · resets 3pm"]), true);
+  assert.equal(hasLimitEvidence(["You\u2019ve reached your Fable 5.2 limit"]), true);
+  assert.equal(hasLimitEvidence(["The usage limit has been reached"]), true);
+  assert.equal(hasLimitEvidence(["connection reset", "rate limiting is a topic"]), false);
+  assert.equal(hasLimitEvidence([]), false);
+});
+
+const rot = (over: Partial<Parameters<typeof shouldAllowRotation>[0]> = {}) =>
+  shouldAllowRotation({ reason: "refresh", status: "error", archived: false, limitEvidence: true, lastAllowedAt: undefined, now: 1_000_000, windowMs: 1_800_000, ...over });
+
+test("shouldAllowRotation: allows once, denies within the window, allows after it", () => {
+  assert.equal(rot(), true);
+  assert.equal(rot({ lastAllowedAt: 1_000_000 - 60_000 }), false);
+  assert.equal(rot({ lastAllowedAt: 1_000_000 - 1_800_000 }), true);
+});
+
+test("shouldAllowRotation: denies resume/import/create, non-error, archived, no evidence", () => {
+  for (const reason of ["resume", "import", "create"]) assert.equal(rot({ reason }), false);
+  assert.equal(rot({ status: "idle" }), false);
+  assert.equal(rot({ archived: true }), false);
+  assert.equal(rot({ limitEvidence: false }), false);
+});
+
+test("resolveRotationMinutes: value when ready, default otherwise; schema default 30", () => {
+  assert.equal(resolveRotationMinutes({ status: "ready", values: { rotationExemptMinutes: 5 } }, 30), 5);
+  assert.equal(resolveRotationMinutes({ status: "invalid" }, 30), 30);
+  assert.equal(resolveRotationMinutes(null, 30), 30);
+  assert.equal(ResumeGuardSettingsSchema.parse({}).rotationExemptMinutes, 30);
 });

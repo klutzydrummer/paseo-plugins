@@ -13,13 +13,21 @@ It never blocks `running`, `idle`, `initializing`, or `closed` agents, whatever 
 
 The thrown error carries the whole deny message: it names the agent id, the approximate context (`~60k`), the threshold, and says: do not resume — write/refresh `<task>/workers/<agent-id>/handoff.md` and spawn a fresh agent pointed at it. `<task>` is a placeholder: the plugin cannot know which task directory the agent belongs to, so the sender fills it in.
 
+## Rotation exemption
+
+ZeroSub moves an agent that hit an account limit by reloading it (`reason: "refresh"`), and that agent is in status `"error"`, so the guard would block the move. One such refresh per agent is therefore allowed when all hold: `reason === "refresh"`, status `"error"`, the agent is not archived, and the tail of its timeline (20 items) contains a CLI limit notice ("You've hit your 5-hour limit", "You've reached your … limit", "The usage limit has been reached"). Every other open (resume, import, create-with-history, a refresh without a limit notice) is still blocked.
+
+The exemption is spent when granted: a second one for the same agent within `rotationExemptMinutes` (default 30) is blocked, which stops reload loops. The grant time is kept in memory and in `$XDG_STATE_HOME/paseo-plugins/resume-guard/rotation-allowed.json`. Allows are logged as `rotation allow`.
+
+Evidence is timeline text, not a ZeroSub `zerosub.state` call: the plugin SDK documents no plugin-to-plugin RPC. The payload alone cannot tell a rotation from a manual refresh, so a manual refresh of a limit-errored agent is also allowed once.
+
 ## Known limit
 
 A throw from `agent.open.before` surfaces to the client as the generic failure text `Plugin resume-guard agent.open.before failed: <message>`, not a custom deny message. The reason lives in the thrown error text for that reason. The hook only fires when a provider session opens; sending a prompt to an already-open errored agent does not pass through it.
 
 ## Settings
 
-`thresholdTokens` (default 30000), under Settings → Plugins → Resume Guard, or by hand in `<paseoHome>/plugin-settings/resume-guard/config.json`.
+`thresholdTokens` (default 30000) and `rotationExemptMinutes` (default 30), under Settings → Plugins → Resume Guard, or by hand in `<paseoHome>/plugin-settings/resume-guard/config.json`.
 
 ## Install
 

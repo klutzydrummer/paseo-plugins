@@ -2,7 +2,12 @@
 // real hook path (settings read -> snapshot read -> decision -> throw or allow). Run: npm test.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import os from "node:os";
+import path from "node:path";
+import fs from "node:fs";
 import contribute from "../index.server.ts";
+
+const LIMIT_TEXT = "You've hit your 5-hour limit · resets 3pm";
 
 type Snapshot = { status: string | null; lastUsage: { contextWindowUsedTokens?: number } | null };
 
@@ -11,6 +16,9 @@ function harness(over: {
   status?: string | null;
   lastUsage?: { contextWindowUsedTokens?: number } | null;
   refreshError?: boolean;
+  reason?: string;
+  timelineTexts?: string[];
+  stateFile?: string;
 } = {}) {
   const hooks = new Map<string, (payload: any, context: any) => Promise<any>>();
   let removed = false;
@@ -29,12 +37,16 @@ function harness(over: {
           : async () => undefined,
         status: over.status ?? null,
         lastUsage: over.lastUsage ?? null,
+        timeline: {
+          refetch: async () => ({ entries: (over.timelineTexts ?? []).map((text) => ({ item: { type: "assistant_message", text } })) }),
+        },
       }),
     },
   };
-  const off = contribute(server as never);
+  const stateFile = over.stateFile ?? path.join(fs.mkdtempSync(path.join(os.tmpdir(), "rg-test-")), "state.json");
+  const off = contribute(server as never, stateFile);
   const hook = hooks.get("agent.open.before")!;
-  const run = () => hook({ request: { agentId: "agent-abc123" } }, { paseo });
+  const run = () => hook({ request: { agentId: "agent-abc123", reason: over.reason } }, { paseo });
   return { run, hook, off: () => off(), assertRemoved: () => assert.equal(removed, true) };
 }
 
@@ -128,4 +140,41 @@ test("cleanup removes the hook", () => {
   const h = harness();
   h.off();
   h.assertRemoved();
+});
+
+// Rotation exemption: one allowed refresh of an errored agent with a limit notice, then blocked again.
+
+const rotating = (extra: Parameters<typeof harness>[0] = {}) =>
+  harness({ status: "error", lastUsage: { contextWindowUsedTokens: 86_000 }, reason: "refresh", timelineTexts: [LIMIT_TEXT], ...extra });
+
+test("rotation: error + refresh + limit notice allowed once, second within the window denied", async () => {
+  const h = rotating();
+  assert.equal(await h.run(), undefined);
+  await assert.rejects(h.run(), /may not be opened/);
+});
+
+test("rotation: allowedAt persists in the state file across plugin restarts", async () => {
+  const stateFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "rg-test-")), "state.json");
+  const a = rotating({ stateFile });
+  assert.equal(await a.run(), undefined);
+  const b = rotating({ stateFile });
+  await assert.rejects(b.run(), /may not be opened/);
+});
+
+test("rotation: allowed again once the window has passed (0 minutes)", async () => {
+  const h = rotating({ read: async () => ({ status: "ready", values: { thresholdTokens: 30_000, rotationExemptMinutes: 0 } }) });
+  assert.equal(await h.run(), undefined);
+  assert.equal(await h.run(), undefined);
+});
+
+test("rotation: error + resume with limit notice denied", async () => {
+  await assert.rejects(rotating({ reason: "resume" }).run(), /may not be opened/);
+});
+
+test("rotation: error + refresh without limit evidence denied", async () => {
+  await assert.rejects(rotating({ timelineTexts: ["ordinary crash"] }).run(), /may not be opened/);
+});
+
+test("rotation: non-error status still allowed", async () => {
+  assert.equal(await rotating({ status: "idle" }).run(), undefined);
 });
