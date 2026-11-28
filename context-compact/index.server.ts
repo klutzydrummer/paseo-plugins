@@ -6,6 +6,7 @@ import path from "node:path";
 import fsNode from "node:fs";
 import { createLabelStore } from "./shared/labels";
 import { createStow, STOW_MAX_AGE_MS } from "./shared/stow";
+import { createRotation } from "./shared/rotation";
 import { compactEnv, contextCompactSettings, type ContextCompactSettings } from "./shared/settings";
 import { buildNudgeText, type NudgeLevel, classifyPct, contextPct, isNudgeEcho, providerMatches, turnEligible } from "./shared/decision";
 
@@ -34,6 +35,9 @@ const CLAUDE_PROJECTS = path.join(HOME, ".claude", "projects");
 const TAIL_BYTES = 512 * 1024;
 const FLUSH_RETRY_MS = 1500;
 const STOW_DIR = path.join(process.env.XDG_STATE_HOME || path.join(HOME, ".local", "state"), "paseo-plugins", "context-compact", "stow");
+
+const ROTATION_DIR = path.join(process.env.XDG_STATE_HOME || path.join(HOME, ".local", "state"), "paseo-plugins", "context-compact", "rotation");
+const TRANSCRIPT_MAX_BYTES = 50 * 1024 * 1024;
 
 async function listFiles(dir: string): Promise<string[]> {
   try {
@@ -105,6 +109,22 @@ async function turnTimeline<T>(paseo: any, agentId: string, given: readonly T[],
   return page.entries.map((entry: { item: T }) => entry.item);
 }
 
+/** Raw session jsonl (last 50 MB at most: a cut first line is dropped by the delta parser). */
+async function readTranscript(agentId: string): Promise<string | null> {
+  const file = await transcriptFor(agentId);
+  if (!file) return null;
+  const fh = await fs.open(file, "r");
+  try {
+    const { size } = await fh.stat();
+    const start = Math.max(0, size - TRANSCRIPT_MAX_BYTES);
+    const buf = Buffer.alloc(size - start);
+    await fh.read(buf, 0, buf.length, start);
+    return buf.toString("utf8");
+  } finally {
+    await fh.close();
+  }
+}
+
 const IDLE_POLL_MS = 500;
 const IDLE_SETTLE_MS = 1000;
 const IDLE_TIMEOUT_MS = 60_000;
@@ -162,6 +182,34 @@ export default function contribute(server: PluginServerContext) {
   } catch (error) {
     console.error("[context-compact] loading stowed notes failed:", (error as Error)?.message ?? error);
   }
+  // Rotation seed: see shared/rotation.ts. `sdk` is set by the first hook that carries a `paseo`.
+  const rotation = createRotation({
+    sendClear: (id) => sdk.agents.ref(id).send("/clear"),
+    waitIdle: (id) => waitIdle(sdk, id),
+    sendText: (id, text) => sdk.agents.ref(id).send(text),
+    getStatus: async (id) => {
+      const ref = sdk.agents.ref(id);
+      await ref.refresh();
+      return ref.status;
+    },
+    readTranscript,
+  }, {
+    dir: ROTATION_DIR,
+    fs: fsNode,
+    log: (m) => console.log(`[context-compact] ${m}`),
+  });
+  try {
+    const n = rotation.load();
+    if (n > 0) console.log(`[context-compact] ${n} rotation seed(s) pending from ${ROTATION_DIR}; resuming on the first hook`);
+  } catch (error) {
+    console.error("[context-compact] loading rotation state failed:", (error as Error)?.message ?? error);
+  }
+  let resumedPending = false;
+  function resumeOnce() {
+    if (resumedPending || !sdk) return;
+    resumedPending = true;
+    rotation.resumePending().catch((e) => console.error("[context-compact] resuming rotation seeds failed:", (e as Error)?.message ?? e));
+  }
   const stowHandoff = defineAgentTool({
     name: "stow_handoff",
     title: "Stow handoff",
@@ -171,14 +219,34 @@ export default function contribute(server: PluginServerContext) {
     execute({ text }, { agent, paseo }) {
       sdk = paseo;
       const r = stow.stow(agent.id, text);
+      if (r.ok) rotation.recordHandoff(agent.id, text);
       return { text: r.message, isError: !r.ok };
     },
   });
 
-  const removeTools = server.addHook("agent.open.before", async ({ request }) => {
+  const removeTools = server.addHook("agent.open.before", async ({ request }, { paseo }) => {
     // turn_ended's agent carries no labels; record them here (fires on create/resume/refresh/import).
     labelStore.record(request.agentId, request.labels);
+    sdk = paseo;
+    resumeOnce();
     const s = await current();
+    // Landing detection (no agent.open.after exists): a "refresh" open of an agent whose status is "error" is the
+    // ZeroSub failover reload (the same discriminator resume-guard uses). The sequence runs detached and polls until the
+    // agent is idle again, so this hook returns at once and never awaits a write to the opening agent.
+    if (s?.rotationSeed && request.reason === "refresh" && request.purpose === "interactive") {
+      try {
+        const ref = paseo.agents.ref(request.agentId);
+        await ref.refresh();
+        if (ref.status === "error") {
+          rotation
+            .onReloaded(request.agentId, { provider: request.provider, enabled: true })
+            .then((o) => console.log(`[context-compact] ${request.agentId.slice(0, 8)} rotation seed: ${o}`))
+            .catch((e) => console.error("[context-compact] rotation seed crashed:", (e as Error)?.message ?? e));
+        }
+      } catch (error) {
+        console.error("[context-compact] rotation status read failed:", (error as Error)?.message ?? error);
+      }
+    }
     if (!s || !s.enabled || !s.providers.includes(request.provider)) return undefined;
     if (request.purpose !== "interactive") return undefined;
     return { ...request, tools: [...request.tools, stowHandoff] };
@@ -217,7 +285,7 @@ export default function contribute(server: PluginServerContext) {
         .finally(() => delivering.delete(agent.id));
       return;
     }
-    if (delivering.has(agent.id)) return; // the /clear's own turn end: stale transcript, no nudge check
+    if (delivering.has(agent.id) || rotation.busy(agent.id)) return; // the /clear's own turn end: stale transcript, no nudge check
     try {
       const s = await current();
       if (!s || !turnEligible(s, labelStore.withLabels(agent), outcome.kind)) return;

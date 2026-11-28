@@ -43,3 +43,20 @@ paseo plugin add ./context-compact    # from a clone of this repository
 ## License
 
 MIT
+
+## Rotation seed
+
+When a ZeroSub failover reload lands on a Claude agent, the plugin `/clear`s the agent in place and sends it a seed: its
+last stowed handoff text (recorded when `stow_handoff` is called) plus a delta of its Claude session transcript since the
+last `/clear` row. Tool results in the delta are shortened to 500 chars; user and assistant text is kept. The seed is
+capped at 40,000 chars; over the cap the full delta is written to
+`$XDG_STATE_HOME/paseo-plugins/context-compact/rotation/delta/<agentId>.md` (0600, removed after 24 h) and the seed asks the
+agent to read it in 20k-char pieces and fold missing facts into its handoff.md. An agent that never stowed gets the delta
+with a statement that no handoff exists.
+
+- Landing detection: `agent.open.before` with reason `refresh` for an agent whose status is `error` starts a detached
+  poll until the agent is `idle`. A `running` agent is skipped (never cleared under a turn). No ZeroSub hook is used.
+- Needs ZeroSub `autoContinue` off (or it can win the race and prompt the agent first) and resume-guard's one-shot
+  exemption for the reload.
+- Claude agents only; at most one seed per agent per 10 minutes; the pending seed is persisted before the `/clear`, so a
+  daemon restart re-delivers it. Setting `rotationSeed` (default on) turns the feature off.

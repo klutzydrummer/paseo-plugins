@@ -32,6 +32,11 @@ export const ContextCompactSettingsSchema = z.object({
    */
   nudgeLabelKey: z.string().default("studio.role"),
   nudgeLabelValue: z.string().default("mm"),
+  /**
+   * After a ZeroSub failover reload lands on a Claude agent, /clear it in place and seed it with its last stowed handoff
+   * plus a capped transcript delta (see README "Rotation seed"). Turn off to leave rotated agents alone.
+   */
+  rotationSeed: z.boolean().default(true),
   /** Soft nudge text. {pct} {window} {compact} are substituted. */
   handoffPrompt: z
     .string()
