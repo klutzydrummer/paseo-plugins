@@ -18,6 +18,10 @@ function harness(over: {
   refreshError?: boolean;
   reason?: string;
   timelineTexts?: string[];
+  lastError?: string;
+  timelineDelayMs?: number;
+  timelineSpy?: { calls: number };
+  evidenceTimeoutMs?: number;
   stateFile?: string;
 } = {}) {
   const hooks = new Map<string, (payload: any, context: any) => Promise<any>>();
@@ -37,14 +41,19 @@ function harness(over: {
           : async () => undefined,
         status: over.status ?? null,
         lastUsage: over.lastUsage ?? null,
+        lastError: over.lastError,
         timeline: {
-          refetch: async () => ({ entries: (over.timelineTexts ?? []).map((text) => ({ item: { type: "assistant_message", text } })) }),
+          refetch: async () => {
+            if (over.timelineSpy) over.timelineSpy.calls++;
+            if (over.timelineDelayMs) await new Promise((r) => setTimeout(r, over.timelineDelayMs));
+            return { entries: (over.timelineTexts ?? []).map((text) => ({ item: { type: "assistant_message", text } })) };
+          },
         },
       }),
     },
   };
   const stateFile = over.stateFile ?? path.join(fs.mkdtempSync(path.join(os.tmpdir(), "rg-test-")), "state.json");
-  const off = contribute(server as never, stateFile);
+  const off = contribute(server as never, stateFile, over.evidenceTimeoutMs);
   const hook = hooks.get("agent.open.before")!;
   const run = () => hook({ request: { agentId: "agent-abc123", reason: over.reason } }, { paseo });
   return { run, hook, off: () => off(), assertRemoved: () => assert.equal(removed, true) };
@@ -177,4 +186,26 @@ test("rotation: error + refresh without limit evidence denied", async () => {
 
 test("rotation: non-error status still allowed", async () => {
   assert.equal(await rotating({ status: "idle" }).run(), undefined);
+});
+
+test("rotation: lastError limit notice allows without reading the timeline", async () => {
+  const spy = { calls: 0 };
+  const h = rotating({ timelineTexts: [], lastError: LIMIT_TEXT, timelineSpy: spy });
+  assert.equal(await h.run(), undefined);
+  assert.equal(spy.calls, 0);
+});
+
+test("rotation: slow timeline returns within budget and blocks", async () => {
+  const h = rotating({ timelineDelayMs: 2_000, evidenceTimeoutMs: 50 });
+  const started = Date.now();
+  await assert.rejects(h.run(), /may not be opened/);
+  assert.ok(Date.now() - started < 1_000);
+});
+
+test("rotation: fast timeline evidence still allows when lastError is absent", async () => {
+  assert.equal(await rotating({ timelineDelayMs: 5, evidenceTimeoutMs: 500 }).run(), undefined);
+});
+
+test("rotation: non-limit lastError falls through and still blocks", async () => {
+  await assert.rejects(rotating({ timelineTexts: [], lastError: "ordinary crash" }).run(), /may not be opened/);
 });

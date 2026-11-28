@@ -23,7 +23,7 @@ import { DEFAULT_ROTATION_EXEMPT_MINUTES, DEFAULT_THRESHOLD_TOKENS, resumeGuardS
 //
 // Rotation exemption: ZeroSub reloads (reason "refresh") an agent that hit an account limit, and that agent is in
 // status "error". One such refresh per agent is allowed when its recent timeline carries a CLI limit notice, then
-// blocked again for rotationExemptMinutes. Evidence is the timeline text, not a ZeroSub RPC: the plugin SDK has no
+// blocked again for rotationExemptMinutes. Evidence is the agent lastError, else a bounded (5 s) timeline tail, not a ZeroSub RPC: the plugin SDK has no
 // documented plugin-to-plugin call. allowedAt is kept in memory and in a small state file so a daemon restart
 // does not grant a second exemption.
 //
@@ -37,6 +37,8 @@ const STATE_FILE = path.join(
   "rotation-allowed.json",
 );
 const EVIDENCE_TIMELINE_ITEMS = 20;
+// The hook RPC times out at 30 s, so the timeline read is capped well below that.
+const EVIDENCE_TIMELINE_TIMEOUT_MS = 5_000;
 
 function loadAllowedAt(file: string): Map<string, number> {
   try {
@@ -56,10 +58,21 @@ function saveAllowedAt(file: string, map: Map<string, number>): void {
   }
 }
 
-/** Text of the tail of the agent's timeline; unreadable timeline yields no evidence. */
-async function timelineTexts(ref: any): Promise<string[]> {
+/**
+ * Limit evidence for an errored agent. The agent's lastError (already on the ref after refresh) is checked first;
+ * only when it carries no limit notice is the timeline tail read, bounded by a timeout. A slow or unreadable
+ * timeline yields no evidence, so the open stays blocked as an ordinary resume (fail closed).
+ */
+async function limitEvidence(ref: any, agentId: string, timeoutMs: number = EVIDENCE_TIMELINE_TIMEOUT_MS): Promise<boolean> {
+  if (typeof ref.lastError === "string" && hasLimitEvidence([ref.lastError])) return true;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const page = await ref.timeline.refetch({ direction: "tail", limit: EVIDENCE_TIMELINE_ITEMS, projection: "canonical" });
+    const read = ref.timeline.refetch({ direction: "tail", limit: EVIDENCE_TIMELINE_ITEMS, projection: "canonical" });
+    read.catch(() => undefined); // a read that loses the race must not become an unhandled rejection
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timeline read exceeded ${timeoutMs} ms`)), timeoutMs);
+    });
+    const page = await Promise.race([read, timeout]);
     const texts: string[] = [];
     for (const entry of page.entries as Array<{ item: Record<string, unknown> }>) {
       for (const key of ["text", "message", "error"]) {
@@ -67,14 +80,23 @@ async function timelineTexts(ref: any): Promise<string[]> {
         if (typeof value === "string") texts.push(value);
       }
     }
-    return texts;
+    return hasLimitEvidence(texts);
   } catch (error) {
-    console.error("[resume-guard] timeline unreadable, no limit evidence:", (error as Error)?.message ?? error);
-    return [];
+    console.error(
+      `[resume-guard] ${agentId.slice(0, 8)} no limit evidence (timeline unreadable or too slow), blocking as ordinary resume:`,
+      (error as Error)?.message ?? error,
+    );
+    return false;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-export default function contribute(server: PluginServerContext, stateFile: string = STATE_FILE) {
+export default function contribute(
+  server: PluginServerContext,
+  stateFile: string = STATE_FILE,
+  evidenceTimeoutMs: number = EVIDENCE_TIMELINE_TIMEOUT_MS,
+) {
   const allowedAt = loadAllowedAt(stateFile);
   const settingsHandle = server.registerSettings(resumeGuardSettings);
 
@@ -131,7 +153,7 @@ export default function contribute(server: PluginServerContext, stateFile: strin
         reason: request.reason,
         status: snapshot.status,
         archived: Boolean(ref.archivedAt),
-        limitEvidence: hasLimitEvidence(await timelineTexts(ref)),
+        limitEvidence: await limitEvidence(ref, request.agentId, evidenceTimeoutMs),
         lastAllowedAt: allowedAt.get(request.agentId),
         now,
         windowMs: await rotationWindowMs(),
